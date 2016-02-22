@@ -1739,51 +1739,59 @@ auto asNormalizedPath(R)(R path)
         (isRandomAccessRange!R && hasSlicing!R && hasLength!R || isNarrowString!R) &&
         !isConvertibleToString!R)
 {
-    alias C = Unqual!(ElementEncodingType!R);
-    alias S = typeof(path[0..0]);
+    if (path.empty)
+    {
+        // otherwise we're going to end up with "."
+        return typeof(path.pathSplitter().normalizedPathElements().pathJoinerImpl!true()).init;
+    }
+    return path.pathSplitter().normalizedPathElements().pathJoinerImpl!true();
+}
+
+enum isStringish(R) =
+    isSomeChar!(ElementEncodingType!R) &&
+    (isRandomAccessRange!R && hasSlicing!R && hasLength!R || isNarrowString!R) &&
+    !isConvertibleToString!R;
+
+auto normalizedPathElements(R)(R elements)
+    if (isForwardRange!R && isStringish!(ElementType!R))
+{
+    alias S = ElementType!R;
 
     static struct Result
     {
         @property bool empty()
         {
-            return c == c.init;
+            return front_.empty();
         }
 
-        @property C front()
+        @property S front()
         {
-            return c;
+            return front_;
         }
 
         void popFront()
         {
-            C lastc = c;
-            c = c.init;
-            if (!element.empty)
-            {
-                c = getElement0();
-                return;
-            }
           L1:
             while (1)
             {
-                if (elements.empty)
+                if (remaining_.empty)
                 {
-                    element = element[0..0];
+                    front_ = front_[0..0];
                     return;
                 }
-                element = elements.front;
-                elements.popFront();
-                if (isDot(element) || (rooted && isDotDot(element)))
+                front_ = remaining_.front;
+                remaining_.popFront();
+                if (isDot(front_) || (rooted_ && isDotDot(front_)))
                     continue;
 
-                if (rooted || !isDotDot(element))
+                if (rooted_ || !isDotDot(front_))
                 {
                     int n = 1;
-                    auto elements2 = elements.save;
-                    while (!elements2.empty)
+                    auto remaining2 = remaining_.save;
+                    while (!remaining2.empty)
                     {
-                        auto e = elements2.front;
-                        elements2.popFront();
+                        auto e = remaining2.front;
+                        remaining2.popFront();
                         if (isDot(e))
                             continue;
                         if (isDotDot(e))
@@ -1791,8 +1799,8 @@ auto asNormalizedPath(R)(R path)
                             --n;
                             if (n == 0)
                             {
-                                elements = elements2;
-                                element = element[0..0];
+                                remaining_ = remaining2.save;
+                                front_ = front_[0..0];
                                 continue L1;
                             }
                         }
@@ -1802,57 +1810,35 @@ auto asNormalizedPath(R)(R path)
                 }
                 break;
             }
-
-            static assert(dirSeparator.length == 1);
-            if (lastc == dirSeparator[0] || lastc == lastc.init)
-                c = getElement0();
-            else
-                c = dirSeparator[0];
         }
 
-        static if (isForwardRange!R)
+        @property auto save()
         {
-            @property auto save()
-            {
-                auto result = this;
-                result.element = element.save;
-                result.elements = elements.save;
-                return result;
-            }
+            auto result = this;
+            result.front_ = front_.save;
+            result.remaining_ = remaining_.save;
+            return result;
         }
 
       private:
-        this(R path)
+        this(R elements)
         {
-            element = rootName(path);
-            auto i = element.length;
-            while (i < path.length && isDirSeparator(path[i]))
-                ++i;
-            rooted = i > 0;
-            elements = pathSplitter(path[i .. $]);
-            popFront();
-            if (c == c.init && path.length)
-                c = C('.');
-        }
-
-        C getElement0()
-        {
-            static if (isNarrowString!S)  // avoid autodecode
+            if (elements.empty)
             {
-                C c = element[0];
-                element = element[1 .. $];
+                front_ = S.init[0..0];
+                return;
+            }
+            rooted_ = isRooted(elements.front);
+            remaining_ = elements.save;
+            if (rooted_)
+            {
+                front_ = remaining_.front;
+                remaining_.popFront();
             }
             else
             {
-                C c = element.front;
-                element.popFront();
+                popFront();
             }
-            version (Windows)
-            {
-                if (c == '/')   // can appear in root element
-                    c = '\\';   // use native Windows directory separator
-            }
-            return c;
         }
 
         // See if elem is "."
@@ -1867,14 +1853,15 @@ auto asNormalizedPath(R)(R path)
             return elem.length == 2 && elem[0] == '.' && elem[1] == '.';
         }
 
-        bool rooted;    // the path starts with a root directory
-        C c;
-        S element;
-        typeof(pathSplitter(path[0..0])) elements;
+        bool rooted_;    // the path starts with a root directory
+        S front_;
+        R remaining_;
     }
+    static assert (isForwardRange!Result && isStringish!(ElementType!Result));
 
-    return Result(path);
+    return Result(elements);
 }
+
 
 ///
 unittest
@@ -2107,6 +2094,269 @@ unittest
     }
     else static assert (false);
 }
+
+
+/** Lazily concatenates path segments, adding directory separators as necessary.
+
+    Params:
+        segments = range of path segments, where each segment must be a string
+            or other character range
+
+    Returns:
+        A range of path characters.  This could be an input, forward or
+        bidirectional range, depending on the capabilities of `segments`.
+*/
+auto pathJoiner(Range)(Range segments)
+    if (isInputRange!Range &&
+        (isInputRange!(ElementType!Range)
+        && isSomeChar!(ElementType!(ElementType!Range))))
+{
+    return pathJoinerImpl!false(segments);
+}
+
+///
+unittest
+{
+    import std.array;
+    version (Posix)
+    {
+        assert (pathJoiner(["foo", "bar", "baz"]).array == "foo/bar/baz");
+        assert (pathJoiner(["/foo/", "bar/baz"]).array  == "/foo/bar/baz");
+        assert (pathJoiner(["/foo", "/bar"]).array      == "/foo/bar");
+    }
+
+    version (Windows)
+    {
+        assert (pathJoiner(["foo", "bar", "baz"]).array == `foo\bar\baz`);
+        assert (pathJoiner([`c:\foo`, `bar\baz`]).array == `c:\foo\bar\baz`);
+        assert (pathJoiner(["foo", `\bar`]).array       == `foo\bar`);
+        assert (pathJoiner([`c:\`, `\foo\bar`]).array    == `c:\foo\bar`);
+    }
+}
+
+unittest // non-documented
+{
+    import std.range;
+    // ir() wraps an array in a plain (i.e. non-forward) input range
+    InputRange!(C[]) ir(C)(C[][] p...) { return inputRangeObject(p); }
+
+    import std.algorithm.comparison: equal;
+    version (Posix)
+    {
+        assert (equal(pathJoiner(["foo"]), "foo"));
+        assert (equal(pathJoiner(["/foo/"]), "/foo/"));
+        assert (equal(pathJoiner(["foo", "bar"]), "foo/bar"));
+        assert (equal(pathJoiner(["foo", "bar", "baz"]), "foo/bar/baz"));
+        assert (equal(pathJoiner(["foo/", "bar"]), "foo/bar"));
+        assert (equal(pathJoiner(["foo///", "bar"]), "foo///bar"));
+        assert (equal(pathJoiner(["/foo"w, "bar"w]), "/foo/bar"));
+        assert (equal(pathJoiner(["foo"w, "/bar"w]), "foo/bar"));
+        assert (equal(pathJoiner(["foo"w, "bar/"w]), "foo/bar/"));
+        assert (equal(pathJoiner(["/"d, "foo"d]), "/foo"));
+        assert (equal(pathJoiner([""d, "foo"d]), "foo"));
+        assert (equal(pathJoiner(["foo"d, ""d]), "foo"));
+        assert (equal(pathJoiner(["foo", "bar", "baz"]), "foo/bar/baz"));
+        assert (equal(pathJoiner(["foo"w, "/bar"w, "baz"w]), "foo/bar/baz"));
+
+        static assert (equal(pathJoiner(["foo", "bar", "baz"]), "foo/bar/baz"));
+        static assert (equal(pathJoiner(["foo", "/bar", "baz"]), "foo/bar/baz"));
+
+        assert (equal(pathJoiner(ir("foo")), "foo"));
+        assert (equal(pathJoiner(ir("/foo/")), "/foo/"));
+        assert (equal(pathJoiner(ir("foo", "bar")), "foo/bar"));
+        assert (equal(pathJoiner(ir("foo", "bar", "baz")), "foo/bar/baz"));
+        assert (equal(pathJoiner(ir("foo/", "bar")), "foo/bar"));
+        assert (equal(pathJoiner(ir("foo///", "bar")), "foo///bar"));
+        assert (equal(pathJoiner(ir("/foo"w, "bar"w)), "/foo/bar"));
+        assert (equal(pathJoiner(ir("foo"w, "/bar"w)), "foo/bar"));
+        assert (equal(pathJoiner(ir("foo"w, "bar/"w)), "foo/bar/"));
+        assert (equal(pathJoiner(ir("/"d, "foo"d)), "/foo"));
+        assert (equal(pathJoiner(ir(""d, "foo"d)), "foo"));
+        assert (equal(pathJoiner(ir("foo"d, ""d)), "foo"));
+        assert (equal(pathJoiner(ir("foo", "bar", "baz")), "foo/bar/baz"));
+        assert (equal(pathJoiner(ir("foo"w, "/bar"w, "baz"w)), "foo/bar/baz"));
+    }
+}
+
+
+/*  This function does the work for pathJoiner().
+    If `dotIfEmpty` is true, an empty input path will result in "." as output.
+    Otherwise, an empty input path will result in an empty output.
+*/
+private auto pathJoinerImpl(bool dotIfEmpty, Range)(Range segments)
+    if (isInputRange!Range &&
+        (isInputRange!(ElementType!Range)
+        && isSomeChar!(ElementType!(ElementType!Range))))
+{
+    import std.algorithm.iteration: map;
+    import std.utf: byCodeUnit;
+    auto nonAutoDecodedSegments = segments.map!(byCodeUnit)();
+
+    alias R = typeof(nonAutoDecodedSegments);
+    alias S = ElementType!R;
+    alias C = Unqual!(ElementType!S);
+    enum isBidirectional = isBidirectionalRange!R && isBidirectionalRange!S;
+
+    static struct PathJoiner
+    {
+        @property bool empty()
+        {
+            return front_ == front_.init;
+        }
+
+        @property auto front()
+        {
+            return front_;
+        }
+
+        void popFront()
+        {
+            if (!frontSegment_.empty)
+            {
+                front_ = frontSegment_.front;
+                frontSegment_.popFront();
+                return;
+            }
+            while (!segments_.empty && segments_.front.empty)
+                segments_.popFront();
+            if (!segments_.empty)
+            {
+                frontSegment_ = segments_.front;
+                segments_.popFront();
+                newFrontSegment();
+                return;
+            }
+            static if (isBidirectional)
+            {
+                if (!backSegment_.empty)
+                {
+                    import std.algorithm.mutation: swap;
+                    swap(frontSegment_, backSegment_);
+                    newFrontSegment();
+                    return;
+                }
+                front_ = back_;
+                back_ = back_.init;
+                return;
+            }
+            else
+            {
+                front_ = front_.init;
+            }
+        }
+
+        static if (isBidirectional)
+        {
+            @property auto back()
+            {
+                return back_;
+            }
+
+            void popBack()
+            {
+                if (!backSegment_.empty)
+                {
+                    back_ = backSegment_.back;
+                    backSegment_.popBack();
+                    return;
+                }
+                while (!segments_.empty && segments_.back.empty)
+                    segments_.popBack();
+                if (!segments_.empty)
+                {
+                    backSegment_ = segments_.back();
+                    segments_.popBack();
+                    if (back_ == back_.init || isDirSeparator(back_)
+                        || isDirSeparator(backSegment_.back))
+                    {
+                        back_ = backSegment_.back;
+                        backSegment_.popBack();
+                    }
+                    else
+                    {
+                        static assert (dirSeparator.length == 1);
+                        back_ = cast(C) dirSeparator[0];
+                    }
+                    return;
+                }
+                if (!frontSegment_.empty)
+                {
+                    if (back_ == back_.init || isDirSeparator(back_)
+                        || isDirSeparator(frontSegment_.back))
+                    {
+                        back_ = frontSegment_.back;
+                        frontSegment_.popBack();
+                    }
+                    else
+                    {
+                        static assert (dirSeparator.length == 1);
+                        back_ = cast(typeof(back_)) dirSeparator[0];
+                    }
+                    return;
+                }
+                back_ = back_.init;
+            }
+        }
+
+        static if (isForwardRange!R && isForwardRange!S)
+        {
+            @property auto save()
+            {
+                typeof(this) ret;
+                ret.front_ = front_;
+                ret.frontSegment_ = frontSegment_.save;
+                static if (isBidirectional)
+                {
+                    ret.back_ = back_;
+                    ret.backSegment_ = backSegment_.save;
+                }
+                ret.segments_ = segments_.save;
+                return ret;
+            }
+        }
+
+    private:
+        void newFrontSegment()
+        {
+            assert(!frontSegment_.empty);
+            if (front_ == front_.init || isDirSeparator(front_)
+                || isDirSeparator(frontSegment_.front))
+            {
+                front_ = frontSegment_.front;
+                frontSegment_.popFront();
+            }
+            else
+            {
+                static assert (dirSeparator.length == 1);
+                front_ = cast(typeof(front_)) dirSeparator[0];
+            }
+        }
+
+        this(R segments)
+        {
+            segments_ = segments;
+            popFront();
+            static if (isBidirectional)
+                popBack();
+            static if (dotIfEmpty)
+                if (front_ == front_.init) front_ = '.';
+        }
+
+        C front_;
+        S frontSegment_;
+        static if (isBidirectional)
+        {
+            C back_;
+            S backSegment_;
+        }
+        R segments_;
+    }
+
+    static assert(isForwardRange!PathJoiner || !isForwardRange!R);
+    static assert(isBidirectionalRange!PathJoiner || !isBidirectionalRange!R);
+    return PathJoiner(nonAutoDecodedSegments);
+}
+
 
 /** Slice up a path into its elements.
 
